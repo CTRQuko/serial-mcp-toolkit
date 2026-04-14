@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg/
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+Thumbs.db
+
+# Archivos locales (contienen datos/rutas personales)
+utils/config.ini
+data/devices.json
+data/logs/
+docs/*/
+!docs/session.md
