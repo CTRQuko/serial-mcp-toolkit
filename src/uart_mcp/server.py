@@ -1,435 +1,450 @@
-"""UART MCP - Servidor MCP Universal para comunicación serie."""
+"""UART MCP Server - Main entry point.
 
-from mcp.server.fastmcp import FastMCP
-import serial
-import serial.tools.list_ports
-import os
-import json
-import configparser
+Thin registration layer. All logic lives in the module files:
+  - connection.py  → SessionManager, Session, ConnectionManager
+  - security.py     → Command validation & metacharacter detection
+  - encodings.py    → Hex/base64/text data conversion
+  - checksums.py    → CRC-8, XOR, sum checksums
+  - project.py      → Project documentation & logging
+  - putty.py        → PuTTY detection, download, launch
+  - validators.py   → Serial params validation (baud, parity, etc.)
+  - config.py        → Paths, constants, config loading
+  - errors.py       → Typed exceptions
+"""
+
+import asyncio
+import uuid
 from datetime import datetime
-from pathlib import Path
 
-mcp = FastMCP("UART MCP")
+import serial
+from mcp.server.fastmcp import FastMCP
 
-BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
-DOCS_DIR = BASE_DIR / "docs"
-LOGS_DIR = DATA_DIR / "logs"
-CONFIG_FILE = BASE_DIR / "utils" / "config.ini"
-PUTTY_PATH_DEFAULT = "C:\\Program Files\\PuTTY\\putty.exe"
+from . import (
+    __version__,
+    DEFAULT_BAUD,
+    DEFAULT_DATA_BITS,
+    DEFAULT_STOP_BITS,
+    DEFAULT_PARITY,
+    DEFAULT_FLOW_CONTROL,
+    IDLE_TIMEOUT_SECONDS,
+    DataConverter,
+    ConnectionManager,
+    SessionConfig,
+    has_shell_metacharacters,
+    validate_command,
+    detect_putty,
+    copy_to_portable,
+    download_putty,
+    launch_putty,
+    init_project_doc,
+    update_session_index,
+    load_session_index,
+    get_project_doc,
+    log_to_project,
+    compute_checksum,
+    verify_checksum,
+    load_devices,
+    UartError,
+    ConnectionError,
+    SessionError,
+    SecurityError,
+    ValidationError,
+    EncodingError,
+)
 
-DATA_DIR.mkdir(exist_ok=True)
-LOGS_DIR.mkdir(exist_ok=True)
+mcp = FastMCP(
+    "UART MCP",
+    instructions="""UART MCP - Universal serial port communication server.
 
-DEFAULT_BAUD = 115200
-DEFAULT_TIMEOUT = 10
+Tools for connecting to embedded devices via UART/serial: routers, modems,
+GPON sticks, Arduino, STM32, etc. Supports hex/base64 encoding, checksums,
+project documentation, and PuTTY integration.""",
+)
 
-BASIC_COMMANDS = [
-    "ls",
-    "cat",
-    "pwd",
-    "cd",
-    "grep",
-    "find",
-    "head",
-    "tail",
-    "ip",
-    "ifconfig",
-    "route",
-    "netstat",
-    "arp",
-    "ping",
-    "df",
-    "du",
-    "free",
-    "top",
-    "ps",
-    "whoami",
-    "uname",
-    "uptime",
-    "hostname",
-    "id",
-    "date",
-    "mount",
-    "lsmod",
-    "lspci",
-    "lsusb",
-    "dmesg",
-    "strings",
-    "hexdump",
-    "file",
-]
-
-session_active = {"port": None, "ser": None, "proyecto": None, "dispositivo": None}
-
-PUTTY_PATH = None  # Se carga desde config o usa默认值
+_manager = ConnectionManager()
 
 
-def load_config():
-    """Cargar configuración de utils/config.ini"""
-    global PUTTY_PATH
-    config = configparser.ConfigParser()
-    if CONFIG_FILE.exists():
-        config.read(CONFIG_FILE)
-        if config.has_option("putty", "path"):
-            PUTTY_PATH = config.get("putty", "path")
-        return config
-    PUTTY_PATH = PUTTY_PATH_DEFAULT
-    return {}
+def _active_session_id() -> str | None:
+    sessions = _manager.list_sessions()
+    active = [s for s in sessions if s["state"] == "active"]
+    return active[0]["session_id"] if active else None
 
 
-def load_devices():
-    devices_file = DATA_DIR / "devices.json"
-    if devices_file.exists():
-        return json.loads(devices_file.read_text())
-    return {"devices": {}}
+def _get_active():
+    sid = _active_session_id()
+    if not sid:
+        return None
+    return _manager.get(sid)
 
 
-def save_devices(data):
-    (DATA_DIR / "devices.json").write_text(json.dumps(data, indent=2))
-
-
-def load_session_index():
-    session_file = DOCS_DIR / "session.md"
-    if session_file.exists():
-        return session_file.read_text()
-    return ""
-
-
-def save_session_index(content):
-    (DOCS_DIR / "session.md").write_text(content)
-
-
-def get_project_doc(project: str) -> Path:
-    project_dir = DOCS_DIR / project
-    project_dir.mkdir(exist_ok=True)
-    return project_dir / f"{project}.md"
-
-
-def init_project_doc(proyecto: str, puerto: str, dispositivo: str = ""):
-    doc_file = get_project_doc(proyecto)
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-
-    if not doc_file.exists():
-        content = f"""---
-title: Sesión {proyecto}
-created: {date_str}
-modified: {date_str}
-port: {puerto}
-dispositivo: {dispositivo or "Desconocido"}
----
-
-# Sesión {proyecto}
-
-## Proyecto: {proyecto}
-
-### Sesión 1 - {now.strftime("%d %B %Y")}
-
-#### Conexión
-- Puerto: {puerto}
-- Dispositivo: {dispositivo or "No identificado"}
-- Resultado: ✓ Conectado
-
-#### Comandos Probados
-
-| Comando | Resultado | Notas |
-|---------|----------|-------|
-
-#### Comandos Funcionales
-
-"""
-        doc_file.write_text(content)
-
-    update_session_index(proyecto, "Activo")
-    return doc_file
-
-
-def update_session_index(proyecto: str, status: str = "Activo"):
-    session_file = DOCS_DIR / "session.md"
-    now = datetime.now().strftime("%d %B %Y")
-    content = load_session_index()
-
-    if f"### {proyecto}" in content:
-        lines = content.split("\n")
-        new_lines = []
-        for line in lines:
-            if line.strip().startswith(f"### {proyecto}"):
-                new_lines.append(line)
-                new_lines.append(f"- Estado: [[{proyecto}/{proyecto}.md|{status}]]")
-            else:
-                new_lines.append(line)
-        content = "\n".join(new_lines)
-    else:
-        header = (
-            """---
-title: Sesiones UART
----
-
-# Sesiones UART
-
-## Proyecto Activo
-- **Proyecto:** """
-            + proyecto
-            + """
-- **Última sesión:** """
-            + now
-            + """
-- **Estado:** """
-            + status
-            + """
-
-## Historial de Proyectos
-
-"""
-        )
-        if not content:
-            content = header
-        content += f"### {proyecto}\n- Inicio: {now}\n- Puerto:\n- Dispositivo:\n- Estado: [[{proyecto}/{proyecto}.md|{status}]]\n\n"
-
-    save_session_index(content)
+# ── Port Discovery ──────────────────────────────────────────────────────────
 
 
 @mcp.tool()
 def uart_puertos() -> str:
     """Lista los puertos serie disponibles en el sistema."""
-    ports = list(serial.tools.list_ports.comports())
+    ports = ConnectionManager.list_ports()
     if not ports:
         return "No hay puertos serie disponibles."
-
     result = "Puertos serie disponibles:\n"
-    for i, port in enumerate(ports, 1):
-        result += f"{i}. {port.device}"
-        if port.description:
-            result += f" - {port.description}"
+    for i, p in enumerate(ports, 1):
+        result += f"{i}. {p['device']} - {p['description']}"
+        if p.get("hwid"):
+            result += f" ({p['hwid']})"
         result += "\n"
     return result
 
 
+# ── Session Management ──────────────────────────────────────────────────────
+
+
 @mcp.tool()
-def uart_conectar(proyecto: str, puerto: str = None, dispositivo: str = None) -> str:
+def uart_conectar(
+    proyecto: str,
+    puerto: str = None,
+    dispositivo: str = None,
+    baudrate: int = DEFAULT_BAUD,
+    data_bits: int = DEFAULT_DATA_BITS,
+    stop_bits=DEFAULT_STOP_BITS,
+    parity: str = DEFAULT_PARITY,
+    flow_control: str = DEFAULT_FLOW_CONTROL,
+    auto_reconnect: bool = False,
+) -> str:
     """Conectar a un proyecto existente o crear uno nuevo.
 
-    - Si el proyecto ya existe en memoria → conectar automáticamente (no necesita puerto/dispositivo)
+    - Si el proyecto ya existe en memoria → conectar automaticamente
     - Si es proyecto nuevo → PREGUNTAR puerto y dispositivo al usuario
 
-    Ejemplo proyecto existente: uart_conectar(proyecto="rpi2_casa")
-    Ejemplo proyecto nuevo: uart_conectar(proyecto="mi_nuevo_proyecto", puerto="COM4", dispositivo="Raspberry Pi")
+    Parametros serie completos: baudrate, data_bits (5-8), stop_bits (1/1.5/2),
+    parity (none/even/odd/mark/space), flow_control (none/software/hardware).
+    auto_reconnect: Si True, reconecta automaticamente al perder conexion.
 
     IMPORTANTE: Si es la primera vez con este proyecto, DEBES preguntar al usuario:
-    - ¿Qué puerto COM?
-    - ¿Qué dispositivo?
-    No asumas nada."""
-    global session_active
-
-    if session_active.get("ser") and session_active["ser"].is_open:
-        return f"Ya hay conexión activa en {session_active['port']}. Usa uart_desconectar() primero."
-
-    proyecto = proyecto.strip().lower().replace(" ", "_")
-
-    doc = get_project_doc(proyecto)
-
-    if doc.exists():
-        content = doc.read_text()
-        if "puerto:" in content.lower():
-            for line in content.split("\n"):
-                if line.lower().startswith("port:") or line.lower().startswith(
-                    "- puerto:"
-                ):
-                    puerto_guardado = (
-                        line.split(":")[1].strip() if ":" in line else None
-                    )
-                    if puerto_guardado:
-                        puerto = puerto_guardado
-                        break
-
-        for line in content.split("\n"):
-            if line.lower().startswith("dispositivo:") or line.lower().startswith(
-                "- dispositivo:"
-            ):
-                disp = line.split(":")[1].strip() if ":" in line else None
-                if disp and disp != "No identificado":
-                    dispositivo = disp
-                    break
+    - ?Que puerto COM? - ?Que dispositivo? No asumas nada."""
+    try:
+        config = SessionConfig.from_params(
+            port=puerto or "",
+            baudrate=baudrate,
+            data_bits=data_bits,
+            stop_bits=stop_bits,
+            parity=parity,
+            flow_control=flow_control,
+        )
+        config.auto_reconnect = auto_reconnect
+    except ValidationError as e:
+        return f"[ERROR] Parametros invalidos: {e}"
 
     if not puerto or not dispositivo:
-        return f"⚠️ PRIMERA VEZ con proyecto '{proyecto}'. Debes PREGUNTAR al usuario:\n- ¿Qué puerto COM usar? (ej: COM4, COM5)\n- ¿Qué dispositivo es? (ej: Raspberry Pi, Router OpenWrt, Stick GPON)\n\nNo asumas el puerto - espera respuesta del usuario."
+        existing = _manager.list_sessions()
+        for s in existing:
+            if s["project"] == proyecto.strip().lower().replace(" ", "_"):
+                return f"[WARN] Proyecto '{proyecto}' ya tiene sesion activa ({s['session_id'][:12]}...). Usa uart_estado() para ver."
+
+        return (
+            f"[WARN] PRIMERA VEZ con proyecto '{proyecto}'. "
+            f"Debes PREGUNTAR al usuario:\n"
+            f"- ?Que puerto COM usar? (ej: COM4, COM5)\n"
+            f"- ?Que dispositivo es? (ej: Raspberry Pi, Router OpenWrt, Stick GPON)\n\n"
+            f"No asumas el puerto - espera respuesta del usuario."
+        )
+
+    session_id = f"uart_{uuid.uuid4().hex[:12]}"
+    proyecto = proyecto.strip().lower().replace(" ", "_")
 
     try:
-        ser = serial.Serial(
-            port=puerto,
-            baudrate=DEFAULT_BAUD,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=DEFAULT_TIMEOUT,
-            write_timeout=DEFAULT_TIMEOUT,
-        )
-        session_active = {
-            "port": puerto,
-            "ser": ser,
-            "proyecto": proyecto,
-            "dispositivo": dispositivo,
-            "baudrate": DEFAULT_BAUD,
-        }
+        session = _manager.connect(session_id, proyecto, dispositivo, config)
+    except (ConnectionError, SessionError) as e:
+        return f"[ERROR] {e}"
 
-        init_project_doc(proyecto, puerto, dispositivo)
+    init_project_doc(
+        proyecto,
+        puerto,
+        dispositivo,
+        baudrate,
+        data_bits,
+        stop_bits,
+        parity,
+        flow_control,
+    )
 
-        return f"✓ Conectado a {puerto}\n📱 Dispositivo: {dispositivo}\n📁 Proyecto: {proyecto}"
-
-    except Exception as e:
-        return f"Error al conectar: {e}"
+    return (
+        f"[OK] Conectado a {puerto}\n"
+        f"[DEV] Dispositivo: {dispositivo}\n"
+        f"[PRJ] Proyecto: {proyecto}\n"
+        f"[CFG] {config.config_string()}\n"
+        f"[SID] Sesion: {session_id}"
+    )
 
 
 @mcp.tool()
 def uart_desconectar() -> str:
-    """Cerrar la conexión serie activa."""
-    global session_active
+    """Cerrar la conexion serie activa."""
+    session = _get_active()
+    if not session:
+        return "No hay conexion activa."
 
-    if not session_active.get("ser") or not session_active["ser"].is_open:
-        session_active = {"port": None, "ser": None, "proyecto": None}
-        return "No hay conexión activa."
-
+    proyecto = session.project
     try:
-        session_active["ser"].close()
-        proyecto = session_active.get("proyecto")
-        session_active = {"port": None, "ser": None, "proyecto": None}
+        _manager.disconnect(session.session_id)
+    except SessionError:
+        pass
 
-        if proyecto:
-            update_session_index(proyecto, "Cerrado")
+    if proyecto:
+        update_session_index(proyecto, "Cerrado")
 
-        return "✓ Desconectado."
-
-    except Exception as e:
-        return f"Error al desconectar: {e}"
+    return "[OK] Desconectado."
 
 
 @mcp.tool()
 def uart_estado() -> str:
-    """Ver el estado de la conexión serie."""
-    if not session_active.get("ser") or not session_active["ser"].is_open:
-        return "Sin conexión activa. Usa uart_conectar() primero."
+    """Ver el estado de la conexion serie activa."""
+    session = _get_active()
+    if not session:
+        return "Sin conexion activa. Usa uart_conectar() primero."
 
-    info = session_active
-    return f"Conectado: {info['port']} | 📱 {info.get('dispositivo', 'N/A')} | 📁 {info.get('proyecto', 'N/A')}"
+    info = session.to_dict()
+    return (
+        f"Conectado: {info['port']} | "
+        f"[DEV] {info['device']} | "
+        f"[PRJ] {info['project']} | "
+        f"[CFG] {info['config']} | "
+        f"[SID] {info['session_id'][:12]}..."
+    )
+
+
+@mcp.tool()
+def uart_sesiones() -> str:
+    """Lista todas las sesiones UART (activas e inactivas)."""
+    sessions = _manager.list_sessions()
+    if not sessions:
+        return "No hay sesiones registradas."
+
+    lines = ["Sesiones UART:"]
+    for s in sessions:
+        status = "ACTIVA" if s["state"] == "active" else s["state"]
+        lines.append(
+            f"  [{status}] {s['session_id'][:12]}... | {s['port']} | {s['project']} | {s['config']}"
+        )
+    return "\n".join(lines)
+
+
+# ── Data I/O ────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
 def uart_comando(cmd: str) -> str:
-    """Enviar un comando al dispositivo. Ejemplo: uart_comando("ls -la")"""
-    global session_active
+    """Enviar un comando al dispositivo. Ejemplo: uart_comando("ls -la")
 
-    ser = session_active.get("ser")
-    proyecto = session_active.get("proyecto")
+    WARNING: Los comandos se validan contra una whitelist de seguridad.
+    Metacaracteres como ;, &, |, $ estan prohibidos."""
+    session = _get_active()
+    if not session:
+        return "ERROR: No hay conexion. Usa uart_conectar() primero."
+
+    allowed, reason = validate_command(cmd, session.project)
+    if not allowed:
+        return reason
+
+    ser = session.ser
+    proyecto = session.project
 
     if not ser or not ser.is_open:
-        return "ERROR: No hay conexion. Usa uart_conectar(puerto='COM4', proyecto='nombre')"
-
-    cmd_base = cmd.strip().split()[0] if cmd.strip() else ""
-
-    if proyecto and cmd_base not in BASIC_COMMANDS:
-        doc = get_project_doc(proyecto)
-        if doc.exists():
-            content = doc.read_text()
-            if cmd_base not in content:
-                return f"⚠️ '{cmd_base}' no está en comandos básicos. ¿Confirmas ejecución de '{cmd}'?"
+        if session.config.auto_reconnect:
+            reconnected = session.try_reconnect()
+            if not reconnected:
+                return (
+                    f"[ERROR]Conexion perdida, fallo al reconectar "
+                    f"(intentos: {session._reconnect_attempts})."
+                )
+            ser = session.ser
+        else:
+            return "[ERROR] Conexion perdida. Reconecta con uart_conectar()."
 
     try:
         ser.reset_input_buffer()
         ser.write(f"{cmd}\n".encode())
         ser.flush()
 
+        long_running = any(
+            c in cmd.lower()
+            for c in [
+                "ping",
+                "traceroute",
+                "opkg update",
+                "opkg install",
+                "wget",
+                "curl",
+            ]
+        )
+        read_delay = 2 if long_running else 0.5
+        timeout = 120 if long_running else 30
+
         response = ""
         start = datetime.now()
+        last_data_time = start
 
-        while (datetime.now() - start).seconds < DEFAULT_TIMEOUT:
+        while (datetime.now() - start).seconds < timeout:
             if ser.in_waiting > 0:
                 try:
                     data = ser.read(ser.in_waiting)
                     response += data.decode("utf-8", errors="replace")
-                except:
+                    last_data_time = datetime.now()
+                except Exception:
                     response += data.decode("latin-1", errors="replace")
+                    last_data_time = datetime.now()
             else:
-                if response.strip():
+                if (
+                    datetime.now() - last_data_time
+                ).seconds >= read_delay and response.strip():
                     break
 
         success = bool(response.strip())
 
+        session.stats.record_send(len(cmd.encode()))
+        session.stats.record_receive(len(response.encode()))
+
         if proyecto:
-            log_to_project(proyecto, cmd, response, success)
+            log_to_project(proyecto, cmd, response[:2000], success)
 
         if not success:
-            return f"⚠️ El comando '{cmd}' no dio resultado.\n\nPosibles causas:\n- Comando no disponible\n- Timeout\n- Necesita interacción manual\n\nPara sesión interactiva: usa uart_putty_abrir()"
+            return (
+                f"[WARN] El comando '{cmd}' no dio resultado.\n\n"
+                f"Posibles causas:\n- Comando no disponible\n- Timeout\n"
+                f"- Necesita interaccion manual\n\nPara sesion interactiva: usa uart_putty_abrir()"
+            )
 
-        return response if response else "✓ Enviado."
+        return response if response else "[OK] Enviado."
 
+    except serial.SerialException as e:
+        session.stats.record_error()
+        if session.config.auto_reconnect:
+            reconnected = session.try_reconnect()
+            if reconnected:
+                return (
+                    "[WARN] Conexion se perdio pero se reconecto. Reenvia el comando."
+                )
+        return f"ERROR: {e}"
     except Exception as e:
+        session.stats.record_error()
         return f"ERROR: {e}"
 
 
 @mcp.tool()
-def uart_ver() -> str:
-    """Ver los datos pendientes en el puerto serie."""
-    global session_active
+def uart_ver(encoding: str = "utf8") -> str:
+    """Ver los datos pendientes en el puerto serie.
 
-    ser = session_active.get("ser")
-    if not ser or not ser.is_open:
-        return "No hay conexión."
+    Args:
+        encoding: Formato de salida - utf8 (defecto), hex, base64"""
+    session = _get_active()
+    if not session:
+        return "No hay conexion."
 
-    if ser.in_waiting > 0:
-        data = ser.read(ser.in_waiting)
-        return data.decode("utf-8", errors="replace")
+    if not session.ser or not session.ser.is_open:
+        if session.config.auto_reconnect:
+            reconnected = session.try_reconnect()
+            if not reconnected:
+                return "[ERROR] Conexion perdida, fallo al reconectar."
+        else:
+            return "[ERROR] Conexion perdida."
+
+    if session.ser.in_waiting > 0:
+        data = session.ser.read(session.ser.in_waiting)
+        session.stats.record_receive(len(data))
+        try:
+            return DataConverter.encode(data, encoding)
+        except EncodingError as e:
+            return f"[ERROR] {e}"
     return "Sin datos pendientes."
 
 
 @mcp.tool()
-def uart_enviar(datos: str) -> str:
-    """Enviar datos crudos al dispositivo."""
-    global session_active
+def uart_enviar(datos: str, encoding: str = "utf8") -> str:
+    """Enviar datos crudos al dispositivo.
 
-    ser = session_active.get("ser")
-    if not ser or not ser.is_open:
-        return "No hay conexión."
+    Args:
+        datos: Datos a enviar
+        encoding: Formato de entrada - utf8 (defecto), hex, base64"""
+    session = _get_active()
+    if not session:
+        return "No hay conexion."
 
     try:
-        ser.write(datos.encode())
-        ser.flush()
-        return f"✓ Enviados {len(datos)} bytes."
+        raw = DataConverter.decode(datos, encoding)
+    except EncodingError as e:
+        return f"[ERROR] {e}"
+
+    if not session.ser or not session.ser.is_open:
+        if session.config.auto_reconnect:
+            reconnected = session.try_reconnect()
+            if not reconnected:
+                return "[ERROR] Conexion perdida, fallo al reconectar."
+        else:
+            return "[ERROR] Conexion perdida."
+
+    try:
+        session.ser.write(raw)
+        session.ser.flush()
+        session.stats.record_send(len(raw))
+        return f"[OK] Enviados {len(raw)} bytes (encoding: {encoding})."
+    except serial.SerialException as e:
+        session.stats.record_error()
+        if session.config.auto_reconnect:
+            reconnected = session.try_reconnect()
+            if reconnected:
+                return "[WARN] Conexion perdida pero reconectada. Reenvia los datos."
+        return f"ERROR: {e}"
     except Exception as e:
+        session.stats.record_error()
         return f"ERROR: {e}"
 
 
 @mcp.tool()
 def uart_break() -> str:
-    """Enviar señal BREAK para reiniciar."""
-    global session_active
+    """Enviar senal BREAK para reiniciar."""
+    session = _get_active()
+    if not session:
+        return "No hay conexion."
 
-    ser = session_active.get("ser")
-    if not ser or not ser.is_open:
-        return "No hay conexión."
+    if not session.ser or not session.ser.is_open:
+        return "[ERROR] Conexion perdida."
 
     try:
-        ser.send_break()
-        return "✓ Señal BREAK enviada."
+        session.ser.send_break()
+        return "[OK] Senal BREAK enviada."
     except Exception as e:
+        session.stats.record_error()
         return f"ERROR: {e}"
+
+
+# ── Info & Stats ───────────────────────────────────────────────────────────
 
 
 @mcp.tool()
 def uart_info() -> str:
-    """Ver información del dispositivo conectado."""
-    proyecto = session_active.get("proyecto")
-
-    if not proyecto:
+    """Ver informacion completa de la sesion actual, incluyendo estadisticas."""
+    session = _get_active()
+    if not session:
         return "No hay proyecto activo."
 
-    dispositivo = session_active.get("dispositivo", "Desconocido")
-    port = session_active.get("port", "N/A")
-
-    return f"""📡 {proyecto}
-- Puerto: {port}
-- Dispositivo: {dispositivo}
-- Usa uart_comando("ls") para listar"""
+    info = session.to_dict()
+    stats = info["stats"]
+    return (
+        f"📡 {info['project']}\n"
+        f"  Puerto: {info['port']}\n"
+        f"  Dispositivo: {info['device']}\n"
+        f"  Config: {info['config']}\n"
+        f"  Sesion: {info['session_id'][:16]}...\n"
+        f"  Estado: {info['state']}\n"
+        f"  Creada: {info['created_at'][:19]}\n"
+        f"  ─── Estadisticas ───\n"
+        f"  Bytes enviados: {stats['bytes_sent']}\n"
+        f"  Bytes recibidos: {stats['bytes_received']}\n"
+        f"  Mensajes enviados: {stats['messages_sent']}\n"
+        f"  Mensajes recibidos: {stats['messages_received']}\n"
+        f"  Errores: {stats['errors_count']}\n"
+        f"  Reconexiones: {stats['reconnections']}\n"
+        f"  Ultima actividad: {stats['last_activity'][:19] if stats['last_activity'] else 'N/A'}"
+    )
 
 
 @mcp.tool()
@@ -437,7 +452,6 @@ def uart_dispositivos() -> str:
     """Lista todos los dispositivos conocidos."""
     devices = load_devices()
     all_dev = devices.get("devices", {})
-
     if not all_dev:
         return "No hay dispositivos registrados."
 
@@ -450,313 +464,194 @@ def uart_dispositivos() -> str:
 @mcp.tool()
 def uart_proyecto() -> str:
     """Ver el documento del proyecto actual."""
-    proyecto = session_active.get("proyecto")
+    session = _get_active()
+    if not session:
+        return "Ningun proyecto activo."
 
-    if not proyecto:
-        return "Ningún proyecto activo."
-
-    doc = get_project_doc(proyecto)
-
+    doc = get_project_doc(session.project)
     if doc.exists():
         return doc.read_text()
-
-    return f"No hay documento para {proyecto}."
+    return f"No hay documento para {session.project}."
 
 
 @mcp.tool()
 def uart_indice() -> str:
-    """Ver el índice de todos los proyectos."""
+    """Ver el indice de todos los proyectos."""
     return load_session_index()
 
 
 @mcp.tool()
 def uart_proyectos() -> str:
     """Lista todos los proyectos."""
+    from .config import DOCS_DIR
+
     if not DOCS_DIR.exists():
         return "No hay proyectos."
 
     dirs = [d.name for d in DOCS_DIR.iterdir() if d.is_dir()]
-
     if not dirs:
         return "No hay proyectos."
 
     return "Proyectos:\n" + "\n".join(f"• {p}" for p in dirs)
 
 
+# ── Configuration ───────────────────────────────────────────────────────────
+
+
 @mcp.tool()
 def uart_configurar(accion: str = None) -> str:
     """Configurar el entorno de UART MCP.
 
-    Sin argumentos: Ejecuta scan y muestra menú interactivo.
-    Con accion: Ejecuta la acción seleccionada.
+    Sin argumentos: Ejecuta scan y muestra menu interactivo.
+    Con accion: Ejecuta la accion seleccionada.
 
     Acciones disponibles:
     - "scan": Buscar ejecutables en el sistema
     - "copiar": Copiar ejecutables encontrados a utils/portable/
-    - "descargar": Descargar PuTTY automáticamente
-    - "omitir": Usar solo conexión serie directa
+    - "descargar": Descargar PuTTY automaticamente
+    - "omitir": Usar solo conexion serie directa"""
+    found = detect_putty()
 
-    El LLM debe guiar al usuario seleccionar una opción."""
-    import platform
-    import shutil
-
-    os_name = platform.system()
-    found_paths = {}
-
-    # Buscar ejecutables según SO
-    if os_name == "Windows":
-        putty_paths = [
-            "C:\\Program Files\\PuTTY\\putty.exe",
-            "C:\\Program Files (x86)\\PuTTY\\putty.exe",
-        ]
-        for path in putty_paths:
-            if os.path.exists(path):
-                found_paths["putty"] = path
-                break
-
-        moba_paths = [
-            "C:\\Program Files (x86)\\Mobatek\\MobaXterm\\MobaXterm.exe",
-        ]
-        for path in moba_paths:
-            if os.path.exists(path):
-                found_paths["mobaxterm"] = path
-                break
-
-    elif os_name == "Linux":
-        putty_path = shutil.which("putty")
-        if putty_path:
-            found_paths["putty"] = putty_path
-
-    elif os_name == "Darwin":
-        putty_path = shutil.which("putty")
-        if putty_path:
-            found_paths["putty"] = putty_path
-
-    # Menu interactivo
     if accion is None:
-        if found_paths:
-            return f"""🔍 **UTILIDADES ENCONTRADAS** ({os_name})
-
-Encontré las siguientes herramientas:
-{chr(10).join(f"- {k}: {v}" for k, v in found_paths.items())}
-
-**¿Qué deseas hacer?**
-
-[S] Copiar a utils/portable/ (incluye ejecutables en el proyecto)
-[N] Solo guardar rutas (usa herramientas del sistema)
-[D] Descargar/reinstalar otra versión
-[X] Omitir - Usar solo conexión serie directa
-
-**Nota:** Después de copiar, reinicia el MCP para aplicar cambios."""
-
+        if found:
+            return (
+                f"Utilidades encontradas:\n"
+                + "\n".join(f"- {k}: {v}" for k, v in found.items())
+                + "\n\nQue deseas hacer?\n\n"
+                "[S] Copiar a utils/portable/\n"
+                "[N] Solo guardar rutas\n"
+                "[D] Descargar PuTTY\n"
+                "[X] Omitir - Usar solo serie directa\n\n"
+                "Nota: Despues de copiar, reinicia el MCP."
+            )
         else:
-            return f"""⚠️ **NO SE ENCONTRARON UTILIDADES** ({os_name})
+            return (
+                "[WARN] No se encontraron utilidades.\n\n"
+                "Opciones:\n\n"
+                "[D] Descargar PuTTY automaticamente\n"
+                "[M] Lo manejo manualmente (crear config.ini)\n"
+                "[X] Omitir - Usar solo serie directa\n\n"
+                "Para descargar PuTTY:\n"
+                "- Windows: https://putty.org\n"
+                "- Linux: sudo apt install putty\n"
+                "- macOS: brew install putty"
+            )
 
-No encontré PuTTY ni MobaXterm en este sistema.
-
-**Opciones disponibles:**
-
-[D] Descargar PuTTY automáticamente
-[M] Lo manejo manualmente (crear config.ini)
-[X] Omitir - Usar solo conexión serie directa
-
-**Para descargar PuTTY:**
-- Windows: https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html
-- Linux: `sudo apt install putty` o `sudo yum install putty`
-- macOS: `brew install putty`"""
-
-    # Procesar acciones
     accion = accion.strip().lower() if accion else ""
 
     if accion == "scan":
-        if found_paths:
-            return f"✓ Encontrado: {', '.join(f'{k} en {v}' for k, v in found_paths.items())}"
-        else:
-            return f"⚠️ No se encontraron ejecutables en {os_name}"
+        if found:
+            return (
+                f"[OK] Encontrado: {', '.join(f'{k} en {v}' for k, v in found.items())}"
+            )
+        return "[WARN] No se encontraron ejecutables."
 
     elif accion == "copiar":
-        if not found_paths:
-            return "⚠️ No hay ejecutables para copiar. Ejecuta uart_configurar() sin argumentos primero."
-
-        PORTABLE_DIR = BASE_DIR / "utils" / "portable"
-        PORTABLE_DIR.mkdir(exist_ok=True)
-
-        copied = []
-        for name, src_path in found_paths.items():
-            try:
-                import shutil as sh
-
-                dst = PORTABLE_DIR / src_path.split("\\")[-1].split("/")[-1]
-                sh.copy2(src_path, dst)
-                copied.append((name, str(dst)))
-            except Exception as e:
-                return f"⚠️ Error al copiar {name}: {e}"
-
-        config_content = "# Configuración generada automáticamente\n"
-        for name, path in copied:
-            config_content += f"\n[{name}]\npath = {path}\n"
-
-        try:
-            CONFIG_FILE.write_text(config_content)
-            load_config()
-            return f"""✓ Utilidades copiadas a utils/portable/:
-
-{chr(10).join(f"- {k}: {v}" for k, v in copied)}
-
-⚠️ **REINICIA el MCP** para aplicar los cambios.
-
-Después del reinicio, usa uart_putty_abrir()"""
-        except Exception as e:
-            return f"⚠️ Error al guardar config: {e}"
+        if not found:
+            return "[WARN] No hay ejecutables para copiar. Ejecuta uart_configurar() sin argumentos primero."
+        return copy_to_portable(found)
 
     elif accion == "descargar":
-        return uart_descargar_putty()
+        return download_putty()
 
     elif accion == "omitir":
-        return "✓ Entendido. Usarás solo conexión serie directa.\n\nUsa uart_conectar() para conectar a dispositivos."
+        return "[OK] Entendido. Usaras solo conexion serie directa.\n\nUsa uart_conectar() para conectar a dispositivos."
 
-    else:
-        return """⚠️ Acción no reconocida.
+    return (
+        "[WARN] Accion no reconocida.\n\n"
+        "Acciones validas:\n"
+        "- uart_configurar('scan') - Buscar ejecutables\n"
+        "- uart_configurar('copiar') - Copiar a utils/portable/\n"
+        "- uart_configurar('descargar') - Descargar PuTTY\n"
+        "- uart_configurar('omitir') - Usar solo serie directa"
+    )
 
-Acciones válidas:
-- uart_configurar("scan") - Buscar ejecutables
-- uart_configurar("copiar") - Copiar a utils/portable/
-- uart_configurar("descargar") - Descargar PuTTY
-- uart_configurar("omitir") - Usar solo serie directa"""
+
+# ── Checksums ───────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
-def uart_descargar_putty() -> str:
-    """Descargar e instalar PuTTY automáticamente.
+def uart_checksum(datos: str, algoritmo: str = "xor", encoding: str = "hex") -> str:
+    """Calcular checksum de datos.
 
-    Detecta el sistema operativo y descarga la versión appropriate.
-    Guarda los archivos en utils/portable/ y configura automáticamente."""
-    import platform
-    import urllib.request
-    import zipfile
-    import io
-
-    os_name = platform.system()
-    arch = platform.machine()
-
-    PORTABLE_DIR = BASE_DIR / "utils" / "portable"
-    PORTABLE_DIR.mkdir(exist_ok=True)
-
-    # URLs de descarga según SO
-    if os_name == "Windows":
-        if arch in ["AMD64", "x86_64"]:
-            url = "https://the.earth.li/~sgtatham/putty/latest/64-bit/putty-64bit.zip"
-        else:
-            url = "https://the.earth.li/~sgtatham/putty/latest/win32/putty.zip"
-    elif os_name == "Linux":
-        return """⚠️ En Linux se recomienda instalar via package manager:
-
-sudo apt install putty        # Debian/Ubuntu
-sudo yum install putty        # RedHat/CentOS
-sudo dnf install putty        # Fedora
-
-Después de instalar, ejecuta uart_configurar("scan") para detectar."""
-    elif os_name == "Darwin":
-        return """⚠️ En macOS se recomienda instalar via Homebrew:
-
-brew install putty
-
-Después de instalar, ejecuta uart_configurar("scan") para detectar."""
-    else:
-        return f"⚠️ Sistema operativo no soportado: {os_name}"
+    Args:
+        datos: Datos en hex, base64, o texto plano
+        algoritmo: sum, xor, crc8, crc16
+        encoding: Formato de entrada (hex, base64, utf8)"""
+    try:
+        raw = DataConverter.decode(datos, encoding)
+    except EncodingError as e:
+        return f"[ERROR] {e}"
 
     try:
-        return f"""📥 Descargando PuTTY para {os_name} ({arch})...
+        result = compute_checksum(raw, algoritmo)
+    except ValueError as e:
+        return f"[ERROR] {e}"
 
-URL: {url}
-
-Pero espera - la descarga directa tiene limitaciones:
-1. Require verificar SSL/certificados
-2. Grandes archivos pueden fallar
-3. Sin progreso de descarga visible
-
-**Mejor alternativa:**
-1. Descarga manualmente desde: https://putty.org
-2. Guarda el archivo .exe en: {PORTABLE_DIR}
-3. Ejecuta: uart_configurar("scan")
-
-**O usa el gestor de paquetes de tu sistema:**
-- Windows:winget install PuTTY.PuTTY
-- Linux: sudo apt install putty
-- macOS: brew install putty"""
-
-    except Exception as e:
-        return f"⚠️ Error al preparar descarga: {e}"
+    return f"[OK] Checksum {algoritmo}: {result} (0x{result:02X})"
 
 
-def log_to_project(proyecto: str, command: str, result: str, success: bool):
-    doc = get_project_doc(proyecto)
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
+@mcp.tool()
+def uart_verificar(
+    datos: str, checksum_esperado: int, algoritmo: str = "xor", encoding: str = "hex"
+) -> str:
+    """Verificar checksum de datos.
 
-    if not doc.exists():
-        return
+    Args:
+        datos: Datos a verificar
+        checksum_esperado: Valor esperado del checksum
+        algoritmo: sum, xor, crc8, crc16
+        encoding: Formato de entrada"""
+    try:
+        raw = DataConverter.decode(datos, encoding)
+    except EncodingError as e:
+        return f"[ERROR] {e}"
 
-    content = doc.read_text()
+    computed = compute_checksum(raw, algoritmo)
+    match = computed == checksum_esperado
 
-    content = content.replace("modified:", f"modified: {date_str}")
-
-    result_emoji = "✓" if success else "✗"
-
-    content += f"""
-
-### {now.strftime("%H:%M")} - `{command}`
-```
-{result}
-```
-
-| Comando | Resultado |
-|---------|----------|
-| {command} | {result_emoji} |
-
-"""
-
-    doc.write_text(content)
-
-    log_file = LOGS_DIR / f"{proyecto}.log"
-    with open(log_file, "a") as f:
-        f.write(
-            f"[{date_str} {now.strftime('%H:%M:%S')}] {command}: {'OK' if success else 'FAIL'}\n"
-        )
+    status = (
+        "[OK] Checksum correcto"
+        if match
+        else f"[FAIL] Checksum incorrecto (esperado {checksum_esperado}, calculado {computed})"
+    )
+    return f"{status}\nAlgoritmo: {algoritmo}\nCalculado: {computed} (0x{computed:02X})\nEsperado: {checksum_esperado} (0x{checksum_esperado:02X})"
 
 
-def main():
-    load_config()
-    mcp.run()
+# ── PuTTY ───────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
 def uart_putty_abrir() -> str:
-    """Abrir PuTTY para sesión serie interactiva.
+    """Abrir PuTTY para sesion serie interactiva.
 
-    Requiere que uart_configurar() se haya ejecutado antes para detectar PuTTY.
-    Si no hay configuración, retorna instrucciones para configurar."""
-    import subprocess
+    Requiere que uart_configurar() se haya ejecutado antes."""
+    session = _get_active()
+    port = session.config.port if session else ""
+    baud = session.config.baudrate if session else DEFAULT_BAUD
+    return launch_putty(port, baud)
 
-    global PUTTY_PATH
-    load_config()  # Cargar config actualizada
 
-    if not PUTTY_PATH:
-        return "⚠️ PuTTY no configurado. Ejecuta uart_configurar() primero."
+# ── Cleanup ────────────────────────────────────────────────────────────────
 
-    putty_path = PUTTY_PATH
 
-    try:
-        if session_active.get("ser") and session_active["ser"].is_open:
-            port = session_active["port"]
-            baud = session_active.get("baudrate", DEFAULT_BAUD)
-            subprocess.Popen([putty_path, "-serial", port, "-sercfg", f"{baud},8,n,1"])
-            return f"✓ PuTTY abierto en {port}"
-        else:
-            subprocess.Popen([putty_path])
-            return "✓ PuTTY abierto."
-    except Exception as e:
-        return f"ERROR: {e}"
+@mcp.tool()
+def uart_limpiar_sesiones(max_idle_seconds: int = IDLE_TIMEOUT_SECONDS) -> str:
+    """Limpiar sesiones inactivas que excedan el timeout de inactividad.
+
+    Args:
+        max_idle_seconds: Segundos de inactividad para considerar una sesion idle (default 3600)"""
+    cleaned = _manager.cleanup_idle(max_idle_seconds)
+    if not cleaned:
+        return f"[OK] No hay sesiones inactivas para limpiar (timeout: {max_idle_seconds}s)."
+    return f"[OK] Limpiadas {len(cleaned)} sesiones inactivas: {', '.join(cleaned)}"
+
+
+def main():
+    from .config import load_config
+
+    load_config()
+    mcp.run()
 
 
 if __name__ == "__main__":

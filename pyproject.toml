@@ -1,12 +1,12 @@
 [project]
 name = "uart-mcp"
-version = "1.0.0"
-description = "MCP Universal for serial port device control"
+version = "2.0.0"
+description = "MCP server for serial port communication with multi-session, full serial config, hex/base64 encoding, checksums, and project documentation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "pyserial>=4.0",
+    "pyserial>=3.5",
     "pyyaml>=6.0",
 ]
 
